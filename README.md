@@ -1,7 +1,10 @@
-# The PopLock Resource Pack
-This resource pack enhances your Minecraft experience with custom textures and visual elements.
+# The PopLock Resource Repo
 
-## Installation Instructions
+This repository contains the server visuals and management scripts used to run the PopLock server.
+
+---
+
+## Resource Pack
 
 ### Manual Installation (Java Edition)
 
@@ -18,19 +21,58 @@ This resource pack enhances your Minecraft experience with custom textures and v
 
 ### Compatibility
 
-This resource pack is designed for Minecraft 1.21. Using it with other versions may result in missing textures or visual glitches.
+This resource pack is designed for Minecraft 26.1. Using it with other versions may result in missing textures or visual glitches.
 
-## Features
+### Features
 
 - Custom textures for blocks and items
 - Enhanced visual effects
 - Redesigned user interface elements
 - Improved environmental aesthetics
 
-## Screenshots
+### Screenshots
 
 [Screenshots will be added here]
 
-## Credits
+### Credits
 
 Created by Polymathema
+
+---
+
+## Server Scripts
+
+The `/scripts` folder contains the full management and automation stack for the PopLock server. Designed for a self-hosted Linux environment running PaperMC or Vanilla Minecraft inside a persistent `tmux` session.
+
+See [`/scripts/README.md`](scripts/README.md) for full setup and usage documentation.
+
+### Scripts Overview
+
+| File | Description |
+|---|---|
+| `serv` | Interactive server control CLI — start, stop, backup, restore, update, and more |
+| `start.sh` | Server startup loop with automatic restart and graceful shutdown logic |
+| `snapshot.sh` | Automated daily snapshot script intended to be run by cron at 11:30 PM |
+| `log4j2.xml` | Log4j config to suppress noisy console output from server commands |
+
+### Quick Reference
+
+```bash
+serv start      # Start the server
+serv stop       # Stop the server
+serv restart    # Restart the server
+serv console    # Attach to the live server console (Ctrl+B then D to detach)
+serv status     # Show status, version, uptime, memory, and player count
+serv backup     # Take a full manual backup
+serv restore    # Interactive restore menu for snapshots and backups
+serv update     # Check for and apply the latest PaperMC or Vanilla update
+serv chk        # Check for available updates without applying
+```
+
+### Daily Snapshot Cron
+
+The snapshot script starts a 30-minute in-game countdown before taking the server down, so it should be scheduled at **11:30 PM** to bring the server down at midnight:
+
+```
+30 23 * * * /usr/local/bin/snapshot.sh >> /var/log/minecraft_snapshot.log 2>&1
+```

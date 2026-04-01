@@ -1,0 +1,949 @@
+#!/bin/bash
+
+MINECRAFT_DIR="/usr/local/games/minecraft_server/java"
+ARCHIVE_DIR="$MINECRAFT_DIR/backups"
+BACKUP_DIR="$ARCHIVE_DIR/jars"
+SESSION_NAME="minecraft"
+TMUX_SOCKET="/tmp/minecraft-tmux"
+SERVER_JAR="server.jar"
+
+# ─── API Configuration ───────────────────────────────────────────────────────
+PAPER_API="https://fill.papermc.io/v3/projects/paper"
+
+# ─── Version Helpers ─────────────────────────────────────────────────────────
+
+# Returns "1.21.11-69" style string from version_history.json, or empty.
+get_current_version() {
+  local vfile="$MINECRAFT_DIR/version_history.json"
+  [ -f "$vfile" ] || { echo ""; return; }
+  jq -r '.currentVersion // empty' "$vfile" | cut -d'-' -f1,2
+}
+
+# Returns the MC version string (e.g. "1.21.11") from version_history.json, or empty.
+get_current_mc_version() {
+  local vfile="$MINECRAFT_DIR/version_history.json"
+  [ -f "$vfile" ] || { echo ""; return; }
+  jq -r '.currentVersion // empty' "$vfile" | grep -oP '\(MC: \K[^)]+'
+}
+
+# Extracts version info directly from the jar file for the status command.
+get_jar_version() {
+  local jar_path="$MINECRAFT_DIR/$SERVER_JAR"
+
+  if [ ! -f "$jar_path" ]; then
+    echo "Unknown (File not found)"
+    return
+  fi
+
+  if ! command -v unzip >/dev/null 2>&1; then
+    echo "Unknown (unzip missing)"
+    return
+  fi
+
+  # 1. Check for PaperMC
+  if unzip -l "$jar_path" | grep -qi "papermc"; then
+    local paper_ver
+    paper_ver=$(get_current_version)
+    if [ -n "$paper_ver" ]; then
+      echo "Paper $paper_ver"
+    else
+      echo "Paper Unknown"
+    fi
+    return
+  fi
+
+  # 2. Check for Modern Vanilla (1.18+)
+  if unzip -l "$jar_path" "META-INF/versions.list" >/dev/null 2>&1; then
+    local ver_data
+    ver_data=$(unzip -p "$jar_path" "META-INF/versions.list" | head -n 1 | awk '{print $2}' | cut -d'/' -f1)
+    if [ -n "$ver_data" ]; then
+      echo "Vanilla $ver_data"
+      return
+    fi
+  fi
+
+  # 3. Check for Older Vanilla (pre-1.18)
+  if unzip -l "$jar_path" "version.json" >/dev/null 2>&1; then
+    local ver
+    ver=$(unzip -p "$jar_path" "version.json" | grep '"id"' | head -n 1 | sed -E 's/.*"id"\s*:\s*"([^"]+)".*/\1/')
+    if [ -n "$ver" ]; then
+      echo "Vanilla $ver"
+      return
+    fi
+  fi
+
+  echo "Unknown/Modded"
+}
+
+# Returns "MC_VERSION|BUILD_NUM|FILENAME|DOWNLOAD_URL" for the latest Paper build.
+get_latest_version() {
+  local mc_version
+  mc_version=$(get_current_mc_version)
+
+  local versions_json
+  versions_json=$(curl -sL -X 'GET' "$PAPER_API/versions" -H 'accept: application/json')
+  [ -z "$versions_json" ] && { echo ""; return; }
+
+  if [ -z "$mc_version" ]; then
+    mc_version=$(echo "$versions_json" | jq -r '.versions[0].version.id' 2>/dev/null)
+  fi
+
+  [ -z "$mc_version" ] || [ "$mc_version" == "null" ] && { echo ""; return; }
+
+  local latest_build
+  latest_build=$(echo "$versions_json" | jq -r ".versions[] | select(.version.id == \"$mc_version\") | .builds | max" 2>/dev/null)
+
+  [ -z "$latest_build" ] || [ "$latest_build" == "null" ] && { echo ""; return; }
+
+  local build_json
+  build_json=$(curl -sL -X 'GET' "$PAPER_API/versions/$mc_version/builds/$latest_build" -H 'accept: application/json')
+
+  local download_url
+  download_url=$(echo "$build_json" | jq -r '.downloads."server:default".url // empty' 2>/dev/null)
+
+  local latest_filename
+  latest_filename=$(echo "$build_json" | jq -r '.downloads."server:default".name // empty' 2>/dev/null)
+
+  if [ -z "$latest_filename" ]; then
+    latest_filename="paper-${mc_version}-${latest_build}.jar"
+  fi
+
+  if [ -z "$download_url" ]; then
+     download_url="https://fill-data.papermc.io/v3/projects/paper/versions/${mc_version}/builds/${latest_build}/downloads/${latest_filename}"
+  fi
+
+  echo "${mc_version}|${latest_build}|${latest_filename}|${download_url}"
+}
+
+# Pretty-prints a version comparison status line. Supports a silent flag.
+check_version_status() {
+  local silent=false
+  if [ "$1" = "-s" ] || [ "$1" = "--silent" ] || [ "$1" = "silent" ]; then
+    silent=true
+  fi
+
+  if [ "$silent" = false ]; then
+    echo -e "\e[3mChecking for updates...\e[0m"
+  fi
+
+  local current_jar_type
+  current_jar_type=$(get_jar_version)
+
+  if [[ "$current_jar_type" == Vanilla* ]]; then
+    local local_vanilla_ver
+    local_vanilla_ver=$(echo "$current_jar_type" | awk '{print $2}')
+
+    local vanilla_manifest latest_vanilla
+    vanilla_manifest=$(curl -sL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json)
+    latest_vanilla=$(echo "$vanilla_manifest" | jq -r '.latest.release // empty')
+
+    if [ -z "$latest_vanilla" ]; then
+      if [ "$silent" = false ]; then
+        echo -e "\e[3;31mCould not reach Mojang API. Current version: ${local_vanilla_ver:-Unknown}\e[0m"
+      fi
+      return
+    fi
+
+    if [ -z "$local_vanilla_ver" ]; then
+      echo -e "\e[3;33mCurrent local Vanilla version unknown. Latest available is \e[1m$latest_vanilla\e[0m\e[3;33m.\e[0m"
+      echo -e "\e[3mRun 'serv update' to install it.\e[0m"
+    elif [ "$local_vanilla_ver" = "$latest_vanilla" ]; then
+      if [ "$silent" = false ]; then
+        echo -e "\e[3;32mServer is up to date — Vanilla $local_vanilla_ver\e[0m"
+      fi
+    else
+      echo -e "\e[3;33mUpdate available: Vanilla \e[1m$latest_vanilla\e[0m\e[3;33m  (current: $local_vanilla_ver)\e[0m"
+      echo -e "\e[3mRun 'serv update' to upgrade.\e[0m"
+    fi
+
+  else
+    local current
+    current=$(get_current_version)
+
+    local latest_info
+    latest_info=$(get_latest_version)
+
+    if [ -z "$latest_info" ]; then
+      if [ "$silent" = false ]; then
+        echo -e "\e[3;31mCould not reach PaperMC API. Current version: ${current:-Unknown}\e[0m"
+      fi
+      return
+    fi
+
+    local latest_mc latest_build latest_filename latest_url
+    IFS='|' read -r latest_mc latest_build latest_filename latest_url <<< "$latest_info"
+    local latest_full="$latest_mc-$latest_build"
+
+    if [ -z "$current" ]; then
+      echo -e "\e[3;33mCurrent local version unknown. Latest available is \e[1m$latest_full\e[0m\e[3;33m.\e[0m"
+      echo -e "\e[3mRun 'serv update' to install it.\e[0m"
+    elif [ "$current" = "$latest_full" ]; then
+      if [ "$silent" = false ]; then
+        echo -e "\e[3;32mServer is up to date — Paper $current\e[0m"
+      fi
+    else
+      echo -e "\e[3;33mUpdate available: Paper \e[1m$latest_full\e[0m\e[3;33m  (current: $current)\e[0m"
+      echo -e "\e[3mRun 'serv update' to upgrade.\e[0m"
+    fi
+  fi
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+case "$1" in
+  start)
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+      echo -e "\e[3;33mA Minecraft server is already running.\e[0m"
+      echo -e "\e[3;33mUse 'serv console' to attach or 'serv restart' to restart.\e[0m"
+    else
+      if tmux -S "$TMUX_SOCKET" has-session -t "$SESSION_NAME" 2>/dev/null && ! pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;33mFound a zombie session without a running server. Cleaning up...\e[0m"
+        tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+      fi
+
+      tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION_NAME" -c "$MINECRAFT_DIR" \
+        "cd $MINECRAFT_DIR && export SERVER_JAR=$SERVER_JAR && ./start.sh 2>/tmp/minecraft_error.log"
+      chmod 770 "$TMUX_SOCKET"
+
+      sleep 3
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;32mMinecraft server started in background\e[0m"
+        echo -e "\e[3mUse 'serv console' to view the server console\e[0m"
+      else
+        echo -e "\e[3;31mFailed to start server! Check permissions:\e[0m"
+        echo -e "\e[3m1. Run: sudo chown -R scyne:scyne $MINECRAFT_DIR\e[0m"
+        echo -e "\e[3m2. Verify: ls -l $MINECRAFT_DIR/start.sh\e[0m"
+        echo -e "\e[3m3. Check error log: cat /tmp/minecraft_error.log\e[0m"
+      fi
+    fi
+    ;;
+
+  stop)
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+      touch "$MINECRAFT_DIR/stop_signal"
+      echo -e "\e[3;33mStopping Minecraft server...\e[0m"
+      tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION_NAME" C-u "stop" Enter
+
+      for i in $(seq 1 30); do
+        sleep 1
+        if ! pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+          echo -e "\e[3;32mMinecraft server stopped successfully\e[0m"
+          tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+          exit 0
+        fi
+      done
+
+      echo -e "\e[3;31mServer didn't stop gracefully. Force killing...\e[0m"
+      pkill -f "java.*-jar $SERVER_JAR" || true
+      tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+    else
+      echo -e "\e[3;31mNo Minecraft server is currently running\e[0m"
+    fi
+    ;;
+
+  restart)
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+      tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION_NAME" C-u "stop" Enter
+      echo -e "\e[3;33mStopping Minecraft server...\e[0m"
+      sleep 10
+      tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null
+    fi
+    tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION_NAME" -c "$MINECRAFT_DIR" \
+      "cd $MINECRAFT_DIR && export SERVER_JAR=$SERVER_JAR && ./start.sh"
+    chmod 770 "$TMUX_SOCKET"
+    echo -e "\e[3;32mMinecraft server restarted in background\e[0m"
+    ;;
+
+  backup)
+    silent=false
+    if [ "$2" = "-s" ] || [ "$2" = "--silent" ] || [ "$2" = "silent" ]; then
+      silent=true
+    fi
+
+    was_running=false
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+      was_running=true
+      [ "$silent" = false ] && echo -e "\e[3;33mServer is running. Stopping for backup...\e[0m"
+
+      if [ "$silent" = true ]; then
+        "$0" stop > /dev/null 2>&1
+      else
+        "$0" stop
+      fi
+    else
+      [ "$silent" = false ] && echo -e "\e[3mServer is offline. Proceeding with backup...\e[0m"
+    fi
+
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    mkdir -p "$ARCHIVE_DIR"
+    backup_file="$ARCHIVE_DIR/minecraft_backup_$timestamp.tar.gz"
+
+    [ "$silent" = false ] && echo -e "\e[3mCreating backup archive...\e[0m"
+
+    tar -czf "$backup_file" \
+      --exclude="backups" \
+      --exclude="*.tar.gz" \
+      --exclude="old.*" \
+      --exclude="OLD*" \
+      --exclude="BuildTools*" \
+      --exclude="cache" \
+      --exclude="work" \
+      -C "$MINECRAFT_DIR" .
+
+    if [ $? -eq 0 ]; then
+      [ "$silent" = false ] && echo -e "\e[3;32mBackup successfully saved to: $backup_file\e[0m"
+    else
+      [ "$silent" = false ] && echo -e "\e[3;31mBackup failed!\e[0m"
+    fi
+
+    if [ "$was_running" = true ]; then
+      [ "$silent" = false ] && echo -e "\e[3;33mRestarting server...\e[0m"
+      if [ "$silent" = true ]; then
+        "$0" start > /dev/null 2>&1
+      else
+        "$0" start
+      fi
+    else
+      [ "$silent" = false ] && echo -e "\e[3mSkipping auto-start since the server was offline.\e[0m"
+    fi
+    ;;
+
+  restore)
+    if [ ! -d "$ARCHIVE_DIR" ]; then
+      echo -e "\e[3;31mBackup directory ($ARCHIVE_DIR) not found.\e[0m"
+      exit 1
+    fi
+
+    mapfile -t all_archives < <(ls -1t "$ARCHIVE_DIR"/*.tar.gz 2>/dev/null)
+
+    if [ ${#all_archives[@]} -eq 0 ]; then
+      echo -e "\e[3;33mNo backups found in $ARCHIVE_DIR\e[0m"
+      exit 0
+    fi
+
+    declare -a options=()
+    declare -A file_groups=()
+
+    for archive in "${all_archives[@]}"; do
+        filename=$(basename "$archive")
+
+        # Daily snapshots — must be checked first since their timestamp would
+        # also match the "Full Backup" pattern below.
+        if [[ "$filename" =~ ^snapshot_([0-9]{4})([0-9]{2})([0-9]{2})_([0-9]{2})([0-9]{2})([0-9]{2})\.tar\.gz$ ]]; then
+            pretty="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+            group="Daily Snapshot: $pretty"
+        elif [[ "$filename" =~ ([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}) ]]; then
+            group="World Set: ${BASH_REMATCH[1]}"
+        elif [[ "$filename" =~ ([0-9]{8}_[0-9]{6}) ]]; then
+            group="Full Backup: ${BASH_REMATCH[1]}"
+        elif [[ "$filename" == "restore_undo.tar.gz" ]]; then
+            group="Restore Undo"
+        else
+            group="Archive: $filename"
+        fi
+
+        if [[ -z "${file_groups[$group]}" ]]; then
+            options+=("$group")
+            file_groups["$group"]="$archive"
+        else
+            file_groups["$group"]="${file_groups[$group]}|$archive"
+        fi
+    done
+
+    echo -e "\e[3mAvailable Backups:\e[0m"
+    for i in "${!options[@]}"; do
+      group_name="${options[$i]}"
+      IFS='|' read -ra arr <<< "${file_groups[$group_name]}"
+      file_count=${#arr[@]}
+      total_size=$(du -ch "${arr[@]}" | tail -n1 | awk '{print $1}')
+      if [ "$file_count" -gt 1 ]; then
+        echo -e "  \e[1m[$i]\e[0m $group_name ($file_count files, $total_size)"
+      else
+        echo -e "  \e[1m[$i]\e[0m $group_name ($total_size)"
+      fi
+    done
+
+    echo ""
+    read -rp $'\e[3mSelect a backup to restore (or press Enter to cancel): \e[0m' choice
+
+    if [[ -z "$choice" ]] || ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -ge "${#options[@]}" ]; then
+      echo -e "\e[3;33mRestore cancelled.\e[0m"
+      exit 0
+    fi
+
+    selected_group="${options[$choice]}"
+    IFS='|' read -ra selected_files <<< "${file_groups[$selected_group]}"
+
+    echo -e "\n\e[3;31mWARNING: Restoring will OVERWRITE the current server files!\e[0m"
+    read -rp $'\e[3mAre you absolutely sure you want to restore '\'"$selected_group"\''? [y/N] \e[0m' confirm
+    confirm="${confirm:-N}"
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      echo -e "\e[3;33mRestore cancelled.\e[0m"
+      exit 0
+    fi
+
+    # ── Stop server ──────────────────────────────────────────────────────────
+    was_running=false
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+      was_running=true
+      echo -e "\e[3;33mServer is running. Stopping for restore...\e[0m"
+      "$0" stop
+      # Verify the server actually stopped — do not proceed if it's still alive
+      sleep 2
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;31mServer did not stop cleanly. Force-killing to prevent world corruption...\e[0m"
+        pkill -9 -f "java.*-jar $SERVER_JAR" || true
+        tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        sleep 2
+      fi
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;31mCould not stop the server. Aborting restore.\e[0m"
+        exit 1
+      fi
+    fi
+
+    undo_file="$ARCHIVE_DIR/restore_undo.tar.gz"
+    restore_errors=0
+
+    if [[ "$selected_group" == "Daily Snapshot:"* ]]; then
+      # ── DAILY SNAPSHOT RESTORE ────────────────────────────────────────────
+      #
+      # Snapshots contain world directories (world, world_nether, world_the_end,
+      # etc.) plus whitelist.json and server.properties, all packed from
+      # MINECRAFT_DIR with relative paths.
+      #
+      # Strategy:
+      #   1. Peek at archive top-level entries to know exactly what to touch.
+      #   2. Undo-backup only those items (worlds + config files).
+      #   3. Wipe existing world directories (not config files — safe to overwrite).
+      #   4. Extract everything to MINECRAFT_DIR.
+      #   5. Remove stale session.lock files.
+
+      echo -e "\e[3mInspecting snapshot contents...\e[0m"
+
+      # Collect unique top-level entries from the archive
+      mapfile -t snap_entries < <(
+        tar -tzf "${selected_files[0]}" 2>/dev/null \
+          | grep -oP '^\.?/?[^/]+' \
+          | sed 's|^\./||' \
+          | sort -u \
+          | grep -v '^$'
+      )
+
+      declare -a snap_world_dirs=()
+      declare -a snap_config_files=()
+
+      for entry in "${snap_entries[@]}"; do
+        full_path="$MINECRAFT_DIR/$entry"
+        if [ -d "$full_path" ]; then
+          snap_world_dirs+=("$entry")
+        elif [ -f "$full_path" ]; then
+          snap_config_files+=("$entry")
+        fi
+      done
+
+      # Build undo targets: existing world dirs + existing config files
+      undo_targets=()
+      for wdir in "${snap_world_dirs[@]}"; do
+        [ -d "$MINECRAFT_DIR/$wdir" ] && undo_targets+=("$wdir")
+      done
+      for cfile in "${snap_config_files[@]}"; do
+        [ -f "$MINECRAFT_DIR/$cfile" ] && undo_targets+=("$cfile")
+      done
+
+      if [ ${#undo_targets[@]} -gt 0 ]; then
+        echo -e "\e[3mCreating undo backup of snapshot targets...\e[0m"
+        tar -czf "$undo_file" -C "$MINECRAFT_DIR" "${undo_targets[@]}"
+        if [ $? -ne 0 ]; then
+          echo -e "\e[3;31mFailed to create undo backup. Aborting restore to prevent data loss.\e[0m"
+          [ "$was_running" = true ] && "$0" start
+          exit 1
+        fi
+        echo -e "\e[3;32mUndo backup saved → $undo_file\e[0m"
+      else
+        echo -e "\e[3;33mNo matching existing files found — proceeding with fresh extract.\e[0m"
+      fi
+
+      # Wipe world directories before extraction so no stale chunk/player
+      # files survive from after the snapshot date.
+      if [ ${#snap_world_dirs[@]} -gt 0 ]; then
+        echo -e "\e[3mRemoving current world directories...\e[0m"
+        for wdir in "${snap_world_dirs[@]}"; do
+          target="$MINECRAFT_DIR/$wdir"
+          if [ -d "$target" ]; then
+            rm -rf "$target"
+            if [ $? -ne 0 ]; then
+              echo -e "\e[3;31mFailed to remove $target. Aborting to prevent a partial restore.\e[0m"
+              echo -e "\e[3;33mUndo backup is at: $undo_file\e[0m"
+              [ "$was_running" = true ] && "$0" start
+              exit 1
+            fi
+            echo -e "\e[3m  Removed: $wdir\e[0m"
+          fi
+        done
+      fi
+
+      # Extract the full snapshot (worlds + config files) into MINECRAFT_DIR
+      echo -e "\e[3mExtracting snapshot...\e[0m"
+      tar -xzf "${selected_files[0]}" -C "$MINECRAFT_DIR"
+      if [ $? -ne 0 ]; then
+        echo -e "\e[3;31mExtraction failed!\e[0m"
+        restore_errors=$((restore_errors + 1))
+      else
+        echo -e "\e[3;32mExtraction complete.\e[0m"
+      fi
+
+      # Remove stale session.lock files from restored world directories
+      for wdir in "${snap_world_dirs[@]}"; do
+        lockfile="$MINECRAFT_DIR/$wdir/session.lock"
+        if [ -f "$lockfile" ]; then
+          rm -f "$lockfile"
+          echo -e "\e[3m  Removed stale session.lock from $wdir\e[0m"
+        fi
+      done
+
+    elif [[ "$selected_group" == "World Set:"* ]]; then
+      # ── WORLD SET RESTORE ─────────────────────────────────────────────────
+      #
+      # Derive the world directory name from each archive filename by stripping
+      # the date-timestamp suffix. Examples:
+      #   world_2025-04-12_19-29-23.tar.gz       → world
+      #   world_nether_2025-04-12_19-29-23.tar.gz → world_nether
+      #   world_the_end_2025-04-12_19-29-23.tar.gz → world_the_end
+      declare -a world_dirs=()
+      for f in "${selected_files[@]}"; do
+        wname=$(basename "$f" | sed -E 's/_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}\.tar\.gz$//')
+        world_dirs+=("$wname")
+      done
+
+      # Undo: snapshot only the world directories being replaced.
+      # This is much faster than archiving the entire server directory.
+      echo -e "\e[3mCreating undo backup of world directories...\e[0m"
+      undo_targets=()
+      for wdir in "${world_dirs[@]}"; do
+        [ -d "$MINECRAFT_DIR/$wdir" ] && undo_targets+=("$wdir")
+      done
+
+      if [ ${#undo_targets[@]} -gt 0 ]; then
+        tar -czf "$undo_file" -C "$MINECRAFT_DIR" "${undo_targets[@]}"
+        if [ $? -ne 0 ]; then
+          echo -e "\e[3;31mFailed to create undo backup. Aborting restore to prevent data loss.\e[0m"
+          [ "$was_running" = true ] && "$0" start
+          exit 1
+        fi
+        echo -e "\e[3;32mUndo backup saved → $undo_file\e[0m"
+      else
+        echo -e "\e[3;33mNo existing world directories found — proceeding with fresh extract.\e[0m"
+      fi
+
+      # ── Wipe target world directories ─────────────────────────────────────
+      # CRITICAL: tar extracts on top of existing directories — it overwrites
+      # matching files but never deletes extras. Any chunk files, player data,
+      # or other files created since the backup date would survive and the world
+      # would look like the current state. We must wipe first for a clean restore.
+      echo -e "\e[3mRemoving current world directories...\e[0m"
+      for wdir in "${world_dirs[@]}"; do
+        target="$MINECRAFT_DIR/$wdir"
+        if [ -d "$target" ]; then
+          rm -rf "$target"
+          if [ $? -ne 0 ]; then
+            echo -e "\e[3;31mFailed to remove $target. Aborting to prevent a partial restore.\e[0m"
+            echo -e "\e[3;33mUndo backup is at: $undo_file\e[0m"
+            [ "$was_running" = true ] && "$0" start
+            exit 1
+          fi
+          echo -e "\e[3m  Removed: $wdir\e[0m"
+        fi
+      done
+
+      # ── Extract each world archive ─────────────────────────────────────────
+      # Handle both packing styles:
+      #   Style A: ./world/region/...   (packed from parent dir) → extract to MINECRAFT_DIR
+      #   Style B: ./region/...         (packed from inside world dir) → extract to MINECRAFT_DIR/world/
+      echo -e "\e[3mExtracting world archives...\e[0m"
+      for f in "${selected_files[@]}"; do
+        fname=$(basename "$f")
+        wname=$(echo "$fname" | sed -E 's/_[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}\.tar\.gz$//')
+        echo -e "\e[3m  -> Unpacking $fname...\e[0m"
+
+        first_entry=$(tar -tzf "$f" 2>/dev/null | head -n 1)
+        first_entry_clean="${first_entry#./}"
+
+        if [[ "$first_entry_clean" == "$wname/"* ]] || [[ "$first_entry_clean" == "$wname" ]]; then
+          tar -xzf "$f" -C "$MINECRAFT_DIR"
+        else
+          mkdir -p "$MINECRAFT_DIR/$wname"
+          tar -xzf "$f" -C "$MINECRAFT_DIR/$wname"
+        fi
+
+        if [ $? -ne 0 ]; then
+          echo -e "\e[3;31m  ERROR extracting $fname\e[0m"
+          restore_errors=$((restore_errors + 1))
+        else
+          echo -e "\e[3;32m  Done: $wname\e[0m"
+        fi
+      done
+
+      # ── Remove stale session locks ─────────────────────────────────────────
+      # session.lock from the archive belongs to a dead server instance.
+      # Leaving it can prevent the server from loading the world on startup.
+      for wdir in "${world_dirs[@]}"; do
+        lockfile="$MINECRAFT_DIR/$wdir/session.lock"
+        if [ -f "$lockfile" ]; then
+          rm -f "$lockfile"
+          echo -e "\e[3m  Removed stale session.lock from $wdir\e[0m"
+        fi
+      done
+
+    elif [ "$selected_group" = "Restore Undo" ]; then
+      # ── UNDO RESTORE ──────────────────────────────────────────────────────
+      # The undo archive for a world-set restore contains just the world dirs.
+      # Peek at its top-level entries so we can wipe those dirs first, giving
+      # a clean restore just like the forward path does.
+      echo -e "\e[3;33mRestoring from the undo backup. No new undo will be created.\e[0m"
+
+      mapfile -t undo_top_dirs < <(
+        tar -tzf "${selected_files[0]}" 2>/dev/null \
+          | grep -oP '^\.?/?[^/]+' \
+          | sed 's|^\./||' \
+          | sort -u \
+          | grep -v '^$'
+      )
+
+      echo -e "\e[3mRemoving directories to be replaced by undo...\e[0m"
+      for tdir in "${undo_top_dirs[@]}"; do
+        target="$MINECRAFT_DIR/$tdir"
+        if [ -d "$target" ]; then
+          rm -rf "$target"
+          echo -e "\e[3m  Removed: $tdir\e[0m"
+        fi
+      done
+
+      echo -e "\e[3mExtracting undo backup...\e[0m"
+      tar -xzf "${selected_files[0]}" -C "$MINECRAFT_DIR"
+      [ $? -ne 0 ] && restore_errors=$((restore_errors + 1))
+
+      for tdir in "${undo_top_dirs[@]}"; do
+        lockfile="$MINECRAFT_DIR/$tdir/session.lock"
+        [ -f "$lockfile" ] && rm -f "$lockfile" && echo -e "\e[3m  Removed stale session.lock from $tdir\e[0m"
+      done
+
+    else
+      # ── FULL BACKUP RESTORE ───────────────────────────────────────────────
+      echo -e "\e[3mCreating full undo backup of current server state...\e[0m"
+      tar -czf "$undo_file" \
+        --exclude="backups" \
+        --exclude="*.tar.gz" \
+        --exclude="old.*" \
+        --exclude="OLD*" \
+        --exclude="BuildTools*" \
+        --exclude="cache" \
+        --exclude="work" \
+        -C "$MINECRAFT_DIR" .
+
+      if [ $? -ne 0 ]; then
+        echo -e "\e[3;31mFailed to create undo backup. Aborting restore to prevent data loss.\e[0m"
+        [ "$was_running" = true ] && "$0" start
+        exit 1
+      fi
+      echo -e "\e[3;32mUndo backup saved → $undo_file\e[0m"
+
+      echo -e "\e[3mExtracting $selected_group...\e[0m"
+      for f in "${selected_files[@]}"; do
+        echo -e "\e[3m  -> Unpacking $(basename "$f")...\e[0m"
+        tar -xzf "$f" -C "$MINECRAFT_DIR"
+        [ $? -ne 0 ] && restore_errors=$((restore_errors + 1))
+      done
+
+      # Clean up all session locks after a full restore
+      find "$MINECRAFT_DIR" -maxdepth 2 -name "session.lock" -delete 2>/dev/null
+      echo -e "\e[3m  Removed stale session.lock files\e[0m"
+    fi
+
+    # ── Result ───────────────────────────────────────────────────────────────
+    if [ $restore_errors -eq 0 ]; then
+      echo -e "\e[3;32mRestore completed successfully!\e[0m"
+    else
+      echo -e "\e[3;31m$restore_errors error(s) occurred during extraction.\e[0m"
+      echo -e "\e[3;33mUndo backup (if created) is at: $undo_file\e[0m"
+    fi
+
+    if [ "$was_running" = true ]; then
+      echo -e "\e[3;33mRestarting server...\e[0m"
+      "$0" start
+    else
+      echo -e "\e[3mServer was offline prior to restore. Leaving offline.\e[0m"
+    fi
+    ;;
+
+  console)
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null || tmux -S "$TMUX_SOCKET" has-session -t "$SESSION_NAME" 2>/dev/null; then
+      echo -e "\e[3mConnecting to Minecraft console. Press Ctrl+B then D to detach.\e[0m"
+      tmux -S "$TMUX_SOCKET" attach -t "$SESSION_NAME"
+    else
+      echo -e "\e[3;31mNo Minecraft server is currently running\e[0m"
+      echo -e "\e[3mUse 'serv start' to start the server first\e[0m"
+    fi
+    ;;
+
+  status)
+    if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+      echo -e "\e[3;32mPopLock is Online\e[0m"
+
+      jar_ver=$(get_jar_version)
+      echo -e "\e[3mVer: $jar_ver\e[0m"
+
+      uptime=$(ps -o etime= -p $(pgrep -f "java.*-jar $SERVER_JAR"))
+      echo -e "\e[3mRunning for: $uptime\e[0m"
+
+      mem_usage=$(ps -o %mem= -p $(pgrep -f "java.*-jar $SERVER_JAR"))
+      echo -e "\e[3mMemory usage: $mem_usage%\e[0m"
+
+      if command -v mcstatus >/dev/null 2>&1; then
+        players=$(mcstatus localhost status | grep -oP 'players: \K\d+/\d+')
+        echo -e "\e[3mPlayers: $players\e[0m"
+      else
+        echo -e "\e[3;33mPlayer count unavailable - install mcstatus: 'pip install mcstatus'\e[0m"
+      fi
+    else
+      echo -e "\e[3;31mPopLock is OFFLINE!!!\e[0m"
+    fi
+    ;;
+
+  update)
+    current_jar_type=$(get_jar_version)
+
+    if [[ "$current_jar_type" == Vanilla* ]]; then
+      local_vanilla_ver=$(echo "$current_jar_type" | awk '{print $2}')
+
+      echo -e "\e[3mChecking latest Vanilla release...\e[0m"
+
+      vanilla_manifest=$(curl -sL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json)
+      latest_vanilla=$(echo "$vanilla_manifest" | jq -r '.latest.release // empty')
+
+      if [ -z "$latest_vanilla" ]; then
+        echo -e "\e[3;31mCould not reach Mojang API. Check your internet connection.\e[0m"
+        exit 1
+      fi
+
+      echo -e "\e[3mCurrent version : \e[1m${local_vanilla_ver:-Unknown}\e[0m"
+      echo -e "\e[3mLatest version  : \e[1m$latest_vanilla\e[0m"
+
+      if [ "$local_vanilla_ver" = "$latest_vanilla" ]; then
+        echo -e "\e[3;32mAlready on the latest version. Nothing to do.\e[0m"
+        exit 0
+      fi
+
+      vanilla_url=$(echo "$vanilla_manifest" | jq -r ".versions[] | select(.id == \"$latest_vanilla\") | .url")
+      vanilla_download=$(curl -sL "$vanilla_url" | jq -r '.downloads.server.url // empty')
+
+      if [ -z "$vanilla_download" ]; then
+        echo -e "\e[3;31mFailed to retrieve valid Vanilla download URL from API.\e[0m"
+        exit 1
+      fi
+
+      echo ""
+      echo -e "\e[3;33mThis will:\e[0m"
+      echo -e "\e[3m  1. Stop the server (if running)\e[0m"
+      if [ -n "$local_vanilla_ver" ]; then
+        echo -e "\e[3m  2. Back up server.jar  →  $BACKUP_DIR/old.vanillaserver.jar\e[0m"
+      else
+        echo -e "\e[3m  2. Proceed with fresh download\e[0m"
+      fi
+      echo -e "\e[3m  3. Download Vanilla $latest_vanilla\e[0m"
+      echo -e "\e[3m  4. Restart the server\e[0m"
+      echo ""
+      read -rp $'\e[3mProceed with update? [y/N] \e[0m' confirm
+      confirm="${confirm:-N}"
+
+      if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "\e[3;33mUpdate cancelled.\e[0m"
+        exit 0
+      fi
+
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;33mStopping server...\e[0m"
+        tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION_NAME" C-u "stop" Enter
+        for i in $(seq 1 30); do
+          sleep 1
+          if ! pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+            break
+          fi
+        done
+        if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+          echo -e "\e[3;31mServer did not stop in time — force-killing.\e[0m"
+          pkill -f "java.*-jar $SERVER_JAR" || true
+          sleep 2
+        fi
+        tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        echo -e "\e[3;32mServer stopped.\e[0m"
+      fi
+
+      if [ -f "$MINECRAFT_DIR/$SERVER_JAR" ]; then
+        mkdir -p "$BACKUP_DIR"
+        cp "$MINECRAFT_DIR/$SERVER_JAR" "$BACKUP_DIR/old.vanillaserver.jar"
+        echo -e "\e[3;32mBacked up current jar  →  $BACKUP_DIR/old.vanillaserver.jar\e[0m"
+      fi
+
+      echo -e "\e[3mDownloading Vanilla $latest_vanilla...\e[0m"
+      tmp_jar="$MINECRAFT_DIR/vanilla_server.tmp"
+
+      if curl -fL --progress-bar -o "$tmp_jar" "$vanilla_download"; then
+        mv "$tmp_jar" "$MINECRAFT_DIR/$SERVER_JAR"
+        echo -e "\e[3;32mDownload complete. server.jar updated to Vanilla $latest_vanilla\e[0m"
+      else
+        echo -e "\e[3;31mDownload failed!\e[0m"
+        if [ -f "$BACKUP_DIR/old.vanillaserver.jar" ]; then
+          echo -e "\e[3;31mRestoring backup...\e[0m"
+          cp "$BACKUP_DIR/old.vanillaserver.jar" "$MINECRAFT_DIR/$SERVER_JAR"
+          echo -e "\e[3;33mOriginal jar restored. No changes made to the server.\e[0m"
+        fi
+        exit 1
+      fi
+
+      echo -e "\e[3mStarting server with updated jar...\e[0m"
+      tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION_NAME" -c "$MINECRAFT_DIR" \
+        "cd $MINECRAFT_DIR && export SERVER_JAR=$SERVER_JAR && ./start.sh"
+      chmod 770 "$TMUX_SOCKET"
+
+      sleep 3
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;32mServer restarted on Vanilla $latest_vanilla\e[0m"
+        echo -e "\e[3mUse 'serv console' to view the console\e[0m"
+      else
+        echo -e "\e[3;31mServer failed to start after update. Check the logs.\e[0m"
+        if [ -f "$BACKUP_DIR/old.vanillaserver.jar" ]; then
+          echo -e "\e[3mBackup is at: $BACKUP_DIR/old.vanillaserver.jar\e[0m"
+        fi
+      fi
+
+    else
+      local_version=$(get_current_version)
+
+      echo -e "\e[3mChecking latest Paper release...\e[0m"
+      latest_info=$(get_latest_version)
+
+      if [ -z "$latest_info" ]; then
+        echo -e "\e[3;31mCould not reach PaperMC API. Check your internet connection.\e[0m"
+        exit 1
+      fi
+
+      latest_mc=""
+      latest_build=""
+      latest_filename=""
+      latest_url=""
+      IFS='|' read -r latest_mc latest_build latest_filename latest_url <<< "$latest_info"
+      latest_full="$latest_mc-$latest_build"
+
+      if [ -n "$local_version" ]; then
+        echo -e "\e[3mCurrent version : \e[1m$local_version\e[0m"
+      else
+        echo -e "\e[3mCurrent version : \e[1mUnknown (Fresh Install?)\e[0m"
+      fi
+
+      echo -e "\e[3mLatest version  : \e[1m$latest_full\e[0m"
+
+      if [ "$local_version" = "$latest_full" ]; then
+        echo -e "\e[3;32mAlready on the latest version. Nothing to do.\e[0m"
+        exit 0
+      fi
+
+      echo ""
+      echo -e "\e[3;33mThis will:\e[0m"
+      echo -e "\e[3m  1. Stop the server (if running)\e[0m"
+      if [ -n "$local_version" ]; then
+        echo -e "\e[3m  2. Back up paper.jar  →  $BACKUP_DIR/paper_${local_version}.jar\e[0m"
+      else
+        echo -e "\e[3m  2. Proceed with fresh download\e[0m"
+      fi
+      echo -e "\e[3m  3. Download $latest_filename\e[0m"
+      echo -e "\e[3m  4. Restart the server\e[0m"
+      echo ""
+      read -rp $'\e[3mProceed with update? [y/N] \e[0m' confirm
+      confirm="${confirm:-N}"
+
+      if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "\e[3;33mUpdate cancelled.\e[0m"
+        exit 0
+      fi
+
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;33mStopping server...\e[0m"
+
+        tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION_NAME" C-u "stop" Enter
+        for i in $(seq 1 30); do
+          sleep 1
+          if ! pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+            break
+          fi
+        done
+        if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+          echo -e "\e[3;31mServer did not stop in time — force-killing.\e[0m"
+          pkill -f "java.*-jar $SERVER_JAR" || true
+          sleep 2
+        fi
+        tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+        echo -e "\e[3;32mServer stopped.\e[0m"
+      fi
+
+      if [ -f "$MINECRAFT_DIR/$SERVER_JAR" ] && [ -n "$local_version" ]; then
+        mkdir -p "$BACKUP_DIR"
+        backup_name="paper_${local_version}.jar"
+        cp "$MINECRAFT_DIR/$SERVER_JAR" "$BACKUP_DIR/$backup_name"
+        echo -e "\e[3;32mBacked up current jar  →  $BACKUP_DIR/$backup_name\e[0m"
+      fi
+
+      if [ -n "$latest_url" ] && [ "$latest_url" != "None" ]; then
+        download_url="$latest_url"
+      else
+        echo -e "\e[3;31mFailed to retrieve valid download URL from API.\e[0m"
+        exit 1
+      fi
+
+      echo -e "\e[3mDownloading $latest_filename...\e[0m"
+      tmp_jar="$MINECRAFT_DIR/${latest_filename}.tmp"
+
+      if curl -fL --progress-bar -o "$tmp_jar" "$download_url"; then
+        mv "$tmp_jar" "$MINECRAFT_DIR/$SERVER_JAR"
+        echo -e "\e[3;32mDownload complete. paper.jar updated to $latest_full\e[0m"
+      else
+        echo -e "\e[3;31mDownload failed!\e[0m"
+        if [ -f "$BACKUP_DIR/$backup_name" ]; then
+          echo -e "\e[3;31mRestoring backup...\e[0m"
+          cp "$BACKUP_DIR/$backup_name" "$MINECRAFT_DIR/$SERVER_JAR"
+          echo -e "\e[3;33mOriginal jar restored. No changes made to the server.\e[0m"
+        fi
+        exit 1
+      fi
+
+      echo -e "\e[3mStarting server with updated jar...\e[0m"
+
+      tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION_NAME" -c "$MINECRAFT_DIR" \
+        "cd $MINECRAFT_DIR && export SERVER_JAR=$SERVER_JAR && ./start.sh"
+      chmod 770 "$TMUX_SOCKET"
+
+      sleep 3
+
+      if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null; then
+        echo -e "\e[3;32mServer restarted on Paper $latest_full\e[0m"
+        echo -e "\e[3mUse 'serv console' to view the console\e[0m"
+      else
+        echo -e "\e[3;31mServer failed to start after update. Check the logs.\e[0m"
+        if [ -n "$backup_name" ]; then
+          echo -e "\e[3mBackup is at: $BACKUP_DIR/$backup_name\e[0m"
+        fi
+      fi
+    fi
+    ;;
+
+  chk)
+    check_version_status "$2"
+    ;;
+
+  *)
+    echo -e "\e[3mServer Control Commands: serv {start|stop|restart|backup|restore|console|status|update|chk [-s]}\e[0m"
+    ;;
+esac
+

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN" packages="net.minecrell.terminalconsole">
+  <Appenders>
+    <TerminalConsole name="TerminalConsole">
+      <RegexFilter regex=".*Played sound.*" onMatch="DENY" onMismatch="NEUTRAL"/>
+      <PatternLayout pattern="%highlightError{[%d{HH:mm:ss} %level]: %msg%n%xEx}" />
+    </TerminalConsole>
+    <RollingRandomAccessFile name="File" fileName="logs/latest.log"
+        filePattern="logs/%d{yyyy-MM-dd}-%i.log.gz">
+      <RegexFilter regex=".*Played sound.*" onMatch="DENY" onMismatch="NEUTRAL"/>
+      <PatternLayout pattern="[%d{HH:mm:ss}] [%t/%level]: %msg%n" />
+      <Policies>
+        <TimeBasedTriggeringPolicy />
+        <OnStartupTriggeringPolicy />
+      </Policies>
+      <DefaultRolloverStrategy max="1000"/>
+    </RollingRandomAccessFile>
+  </Appenders>
+  <Loggers>
+    <Root level="info">
+      <AppenderRef ref="TerminalConsole"/>
+      <AppenderRef ref="File"/>
+    </Root>
+  </Loggers>
+</Configuration>
