@@ -1,0 +1,26 @@
+[Unit]
+Description=PopLock Minecraft API Server
+After=network.target
+# Start after the minecraft server environment is available
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scyne
+Group=scyne
+ExecStart=/usr/bin/node /usr/local/bin/poplock-api.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=poplock-api
+
+# Load API key from config file
+EnvironmentFile=-/etc/poplock-api.conf
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

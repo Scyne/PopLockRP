@@ -76,3 +76,14 @@ The snapshot script starts a 30-minute in-game countdown before taking the serve
 ```
 30 23 * * * /usr/local/bin/snapshot.sh >> /var/log/minecraft_snapshot.log 2>&1
 ```
+
+---
+
+## Server API
+
+The repository also includes a lightweight, zero-dependency Node.js REST API (`poplock-api.js`) for remote server management. Included in the project are the main application file, a systemd service file (`poplock-api.service`), and a configuration file (`poplock-api.conf`) to ensure it runs persistently and securely.
+
+**Key Features:**
+* **Read Endpoints (Public):** Check server status, list online players, read server logs, and view available backups.
+* **Write Endpoints (Secured):** Start, stop, and restart the server, run console commands, manage the whitelist, and trigger silent backups. Write actions are protected by a required `X-API-Key` header.
+* **Integration Ready:** Designed to act as a secure backend for automation platforms like n8n, allowing you to build flows (such as Discord slash commands) where authorized users can manage the server without needing direct SSH access.
