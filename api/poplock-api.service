@@ -20,7 +20,7 @@ EnvironmentFile=-/etc/poplock-api.conf
 
 # Hardening
 NoNewPrivileges=true
-PrivateTmp=true
+PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target
