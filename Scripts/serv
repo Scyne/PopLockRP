@@ -679,7 +679,39 @@ case "$1" in
 
   console)
     if pgrep -f "java.*-jar $SERVER_JAR" > /dev/null || tmux -S "$TMUX_SOCKET" has-session -t "$SESSION_NAME" 2>/dev/null; then
-      echo -e "\e[3mConnecting to Minecraft console. Press Ctrl+B then D to detach.\e[0m"
+      echo -e "\e[1;33m  ★  To detach from console: press Ctrl+B, then D  ★\e[0m"
+      echo -e "\e[3m     Attaching in 5 seconds — press any key to skip...\e[0m"
+      echo ""
+
+      _BAR_WIDTH=38
+      _TOTAL=5
+      _skip=false
+
+      for _i in $(seq "$_TOTAL" -1 1); do
+        _filled=$(( (_TOTAL - _i) * _BAR_WIDTH / _TOTAL ))
+        _empty=$(( _BAR_WIDTH - _filled ))
+        _bar=""
+        for (( _j=0; _j<_filled; _j++ )); do _bar+="█"; done
+        for (( _j=0; _j<_empty;  _j++ )); do _bar+="░"; done
+        printf "  \r  \e[32m[\e[0m%s\e[32m]\e[0m \e[3m%ds \e[0m" "$_bar" "$_i"
+
+        for (( _tick=0; _tick<10; _tick++ )); do
+          if read -rs -n1 -t 0.1 _key 2>/dev/null; then
+            _skip=true
+            break 2
+          fi
+        done
+      done
+
+      if [ "$_skip" = false ]; then
+        _bar=""
+        for (( _j=0; _j<_BAR_WIDTH; _j++ )); do _bar+="█"; done
+        printf "  \r  \e[32m[\e[0m%s\e[32m]\e[0m \e[3m0s \e[0m\n" "$_bar"
+      else
+        printf "\n"
+      fi
+
+      echo -e "\e[3mConnecting...\e[0m"
       tmux -S "$TMUX_SOCKET" attach -t "$SESSION_NAME"
     else
       echo -e "\e[3;31mNo Minecraft server is currently running\e[0m"
