@@ -161,14 +161,12 @@ async function handleStatus(req, res) {
 
   if (running) {
     try {
-      // Uptime from ps
       const pid = execSync(`pgrep -f "java.*-jar ${SERVER_JAR}"`).toString().trim().split('\n')[0];
-      data.pid = parseInt(pid, 10);
-      data.uptime  = execSync(`ps -o etime= -p ${pid}`).toString().trim();
-      data.memory  = execSync(`ps -o %mem= -p ${pid}`).toString().trim() + '%';
+      data.pid    = parseInt(pid, 10);
+      data.uptime = execSync(`ps -o etime= -p ${pid}`).toString().trim();
+      data.memory = execSync(`ps -o %mem= -p ${pid}`).toString().trim() + '%';
     } catch {}
 
-    // Version from version_history.json
     const vh = readJSON(`${MINECRAFT_DIR}/version_history.json`);
     if (vh?.currentVersion) data.version = vh.currentVersion;
   }
@@ -180,11 +178,10 @@ async function handleStatus(req, res) {
 async function handlePlayersOnline(req, res) {
   if (!isServerRunning()) return json(res, { ok: true, online: false, players: [] });
   try {
-    // Parse from latest.log — find last joined/left entries
     const logLines = tailFile(`${LOG_DIR}/latest.log`, 2000) || '';
     const sessions = {};
     for (const line of logLines.split('\n')) {
-      const join = line.match(/INFO\]: (\S+) joined the game/);
+      const join  = line.match(/INFO\]: (\S+) joined the game/);
       const leave = line.match(/INFO\]: (\S+) (left the game|lost connection)/);
       if (join)  sessions[join[1]]  = 'online';
       if (leave) sessions[leave[1]] = 'offline';
@@ -276,19 +273,20 @@ async function handleStart(req, res) {
 }
 
 // POST /api/server/stop
-async function handleStop(req, res) {
-  try {
-    await run(`${SERV_BIN} stop`);
-    json(res, { ok: true, message: 'Server stop command issued.' });
-  } catch (e) { err(res, e.message, 500); }
+// serv stop waits up to 30s for graceful shutdown — fire and forget.
+function handleStop(req, res) {
+  if (!isServerRunning()) {
+    return json(res, { ok: true, message: 'Server is already offline.' });
+  }
+  exec(`${SERV_BIN} stop >> ${SNAPSHOT_LOG} 2>&1 &`);
+  json(res, { ok: true, message: 'Server stop command issued.' });
 }
 
 // POST /api/server/restart
-async function handleRestart(req, res) {
-  try {
-    await run(`${SERV_BIN} restart`);
-    json(res, { ok: true, message: 'Server restart command issued.' });
-  } catch (e) { err(res, e.message, 500); }
+// serv restart sleeps 10s internally — fire and forget.
+function handleRestart(req, res) {
+  exec(`${SERV_BIN} restart >> ${SNAPSHOT_LOG} 2>&1 &`);
+  json(res, { ok: true, message: 'Server restart command issued.' });
 }
 
 // POST /api/command  body: { "command": "say hello" }
@@ -298,7 +296,6 @@ async function handleCommand(req, res) {
   const cmd = (body.command || '').trim();
   if (!cmd) return err(res, '"command" field is required.');
 
-  // Block dangerous shell chars — commands go to tmux only
   if (/[;&|`$(){}[\]<>\\]/.test(cmd)) {
     return err(res, 'Command contains disallowed characters.');
   }
@@ -339,7 +336,6 @@ async function handleWhitelistRemove(req, res) {
 
 // POST /api/backup  →  triggers serv backup -s (silent, non-blocking)
 function handleBackupTrigger(req, res) {
-  // Fire and forget — backup takes time, we just acknowledge receipt
   exec(`${SERV_BIN} backup -s >> ${SNAPSHOT_LOG} 2>&1 &`);
   json(res, { ok: true, message: 'Backup triggered. Check /api/backups shortly.' });
 }
@@ -359,13 +355,13 @@ const ROUTES = {
   'GET /api/properties':        { fn: handleProperties,    auth: false },
 
   // Write (API key required)
-  'POST /api/server/start':     { fn: handleStart,          auth: true },
-  'POST /api/server/stop':      { fn: handleStop,           auth: true },
-  'POST /api/server/restart':   { fn: handleRestart,        auth: true },
-  'POST /api/command':          { fn: handleCommand,        auth: true },
-  'POST /api/whitelist/add':    { fn: handleWhitelistAdd,   auth: true },
+  'POST /api/server/start':     { fn: handleStart,           auth: true },
+  'POST /api/server/stop':      { fn: handleStop,            auth: true },
+  'POST /api/server/restart':   { fn: handleRestart,         auth: true },
+  'POST /api/command':          { fn: handleCommand,         auth: true },
+  'POST /api/whitelist/add':    { fn: handleWhitelistAdd,    auth: true },
   'POST /api/whitelist/remove': { fn: handleWhitelistRemove, auth: true },
-  'POST /api/backup':           { fn: handleBackupTrigger,  auth: true },
+  'POST /api/backup':           { fn: handleBackupTrigger,   auth: true },
 };
 
 // GET /api  →  endpoint index
@@ -380,15 +376,13 @@ function handleIndex(req, res) {
 // ─── Server ───────────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  const urlObj  = new URL(req.url, `http://localhost`);
+  const urlObj   = new URL(req.url, `http://localhost`);
   const pathname = urlObj.pathname.replace(/\/$/, '') || '/';
-  const query   = Object.fromEntries(urlObj.searchParams);
-  const method  = req.method.toUpperCase();
+  const query    = Object.fromEntries(urlObj.searchParams);
+  const method   = req.method.toUpperCase();
 
-  // Log every request
   console.log(`[${new Date().toISOString()}] ${method} ${pathname}`);
 
-  // CORS preflight
   if (method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin':  '*',
@@ -398,7 +392,6 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // API index
   if (method === 'GET' && (pathname === '/api' || pathname === '/api/')) {
     return handleIndex(req, res);
   }
